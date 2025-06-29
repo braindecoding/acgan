@@ -226,49 +226,55 @@ class EEGClassifier:
         
     def build_model(self):
         """Build CNN model untuk EEG classification"""
-        
+
         inputs = layers.Input(shape=self.input_shape)
-        
+
         # Reshape untuk 2D convolution (channels, time, 1)
         x = layers.Reshape((*self.input_shape, 1))(inputs)
-        
+
         # Batch normalization
         x = layers.BatchNormalization()(x)
-        
-        # Temporal convolution
-        x = layers.Conv2D(128, (self.input_shape[0], 1), padding='same', activation='relu')(x)
-        
-        # Spatial convolution
-        x = layers.Conv2D(64, (1, self.input_shape[1]), padding='same', activation='relu')(x)
-        x = layers.MaxPooling2D((1, 2))(x)
-        
-        # Additional conv layers
-        x = layers.Conv2D(64, (4, 25), padding='valid', activation='relu')(x)
-        x = layers.MaxPooling2D((1, 2))(x)
-        
-        x = layers.Conv2D(128, (1, 2), padding='valid', activation='relu')(x)
-        
-        # Flatten and dense layers
-        x = layers.Flatten()(x)
+
+        # Temporal convolution - disesuaikan dengan input shape
+        x = layers.Conv2D(64, (1, 8), padding='same', activation='relu')(x)
         x = layers.BatchNormalization()(x)
-        
+
+        # Spatial convolution - disesuaikan dengan jumlah channel
+        x = layers.Conv2D(64, (4, 1), padding='same', activation='relu')(x)
+        x = layers.BatchNormalization()(x)
+        x = layers.MaxPooling2D((1, 2))(x)
+
+        # Additional conv layers dengan kernel size yang sesuai
+        x = layers.Conv2D(128, (1, 4), padding='same', activation='relu')(x)
+        x = layers.BatchNormalization()(x)
+        x = layers.MaxPooling2D((1, 2))(x)
+
+        x = layers.Conv2D(128, (1, 4), padding='same', activation='relu')(x)
+        x = layers.BatchNormalization()(x)
+
+        # Global Average Pooling untuk mengurangi parameter
+        x = layers.GlobalAveragePooling2D()(x)
+
+        # Dense layers
         x = layers.Dense(512, activation='relu')(x)
-        x = layers.Dropout(0.1)(x)
-        
+        x = layers.Dropout(0.3)(x)
+        x = layers.BatchNormalization()(x)
+
         x = layers.Dense(256, activation='relu')(x)
-        x = layers.Dropout(0.1)(x)
-        
+        x = layers.Dropout(0.3)(x)
+        x = layers.BatchNormalization()(x)
+
         # Latent representation
         latent = layers.Dense(128, activation='relu', name='latent')(x)
-        latent = layers.Dropout(0.1)(latent)
+        latent = layers.Dropout(0.2)(latent)
         latent = layers.BatchNormalization(name='latent_bn')(latent)
-        
+
         # Classification output
         outputs = layers.Dense(self.num_classes, activation='softmax', name='classification')(latent)
-        
+
         self.model = keras.Model(inputs, outputs)
         self.encoder_model = keras.Model(inputs, latent)
-        
+
         return self.model
     
     def compile_model(self, learning_rate=0.001):
@@ -279,14 +285,14 @@ class EEGClassifier:
             metrics=['accuracy']
         )
     
-    def train(self, X_train, y_train, X_val, y_val, epochs=150, batch_size=128):
+    def train(self, X_train, y_train, X_val, y_val, epochs=50, batch_size=64):
         """Train the model"""
-        
+
         callbacks = [
-            keras.callbacks.EarlyStopping(patience=15, restore_best_weights=True),
-            keras.callbacks.ReduceLROnPlateau(factor=0.5, patience=10)
+            keras.callbacks.EarlyStopping(patience=10, restore_best_weights=True),
+            keras.callbacks.ReduceLROnPlateau(factor=0.5, patience=5)
         ]
-        
+
         history = self.model.fit(
             X_train, y_train,
             validation_data=(X_val, y_val),
@@ -295,7 +301,7 @@ class EEGClassifier:
             callbacks=callbacks,
             verbose=1
         )
-        
+
         return history
     
     def evaluate(self, X_test, y_test):
@@ -446,42 +452,45 @@ class ACGAN:
             metrics=['accuracy']
         )
     
-    def train(self, eeg_features, labels, mnist_images, epochs=2000, batch_size=32):
+    def train(self, eeg_features, labels, mnist_images, epochs=500, batch_size=32):
         """Train AC-GAN"""
-        
+
         # Load MNIST for real images
         (x_train, y_train), (_, _) = keras.datasets.mnist.load_data()
         x_train = x_train.astype('float32') / 127.5 - 1.0
         x_train = np.expand_dims(x_train, axis=3)
-        
+
         valid = np.ones((batch_size, 1))
         fake = np.zeros((batch_size, 1))
-        
+
+        print(f"Starting AC-GAN training for {epochs} epochs...")
+
         for epoch in range(epochs):
-            
+
             # Train discriminator
             idx = np.random.randint(0, len(eeg_features), batch_size)
             real_imgs = x_train[idx]
             real_labels = y_train[idx]
-            
+
             # Generate fake images
             fake_labels = labels[idx]
             fake_features = eeg_features[idx]
-            fake_imgs = self.generator.predict([fake_labels, fake_features])
-            
+            fake_imgs = self.generator.predict([fake_labels, fake_features], verbose=0)
+
             # Train discriminator
             d_loss_real = self.discriminator.train_on_batch(real_imgs, [valid, real_labels])
             d_loss_fake = self.discriminator.train_on_batch(fake_imgs, [fake, fake_labels])
             d_loss = 0.5 * np.add(d_loss_real, d_loss_fake)
-            
+
             # Train generator
             g_loss = self.combined.train_on_batch([fake_labels, fake_features], [valid, fake_labels])
-            
-            if epoch % 100 == 0:
+
+            if epoch % 50 == 0:
                 print(f"Epoch {epoch}, D loss: {d_loss[0]:.4f}, G loss: {g_loss[0]:.4f}")
-                
+
                 # Save sample images
-                self.save_sample_images(epoch, eeg_features[:5], labels[:5])
+                if epoch % 100 == 0:
+                    self.save_sample_images(epoch, eeg_features[:5], labels[:5])
     
     def save_sample_images(self, epoch, features, labels):
         """Save sample generated images"""
@@ -576,7 +585,7 @@ def main():
     ac_gan.compile_models()
     
     print("Training AC-GAN...")
-    ac_gan.train(train_features, y_train, None, epochs=2000)
+    ac_gan.train(train_features, y_train, None, epochs=500)
     
     # Generate images and calculate metrics
     generated_images = ac_gan.generator.predict([y_test, test_features])
