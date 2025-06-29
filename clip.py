@@ -10,7 +10,34 @@ from PIL import Image
 from torchvision import datasets, transforms
 from sklearn.metrics.pairwise import cosine_similarity
 import warnings
+import os
+import argparse
 warnings.filterwarnings('ignore')
+
+# GPU Configuration
+def setup_gpu():
+    """Setup GPU configuration for CLIP model"""
+    print("=== GPU Configuration for CLIP ===")
+
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+        print(f"✅ Using GPU: {torch.cuda.get_device_name()}")
+        print(f"📊 GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+
+        # Enable mixed precision for better performance
+        torch.backends.cudnn.benchmark = True
+        print("✅ CUDNN benchmark enabled")
+
+    else:
+        device = torch.device('cpu')
+        print("⚠️  No GPU available, using CPU")
+
+    print(f"🔧 Device: {device}")
+    print("=" * 40)
+    return device
+
+# Setup device globally
+DEVICE = setup_gpu()
 
 class EEGCLIPDataset(Dataset):
     """Dataset yang menggabungkan EEG features dengan MNIST images"""
@@ -52,13 +79,20 @@ class EEGCLIPDataset(Dataset):
 
 class EEGCLIPModel(nn.Module):
     """Main model yang menggunakan CLIP untuk brain-to-image reconstruction"""
-    
-    def __init__(self, eeg_dim=128, clip_model_name="ViT-B/32", n_classes=10):
+
+    def __init__(self, eeg_dim=128, clip_model_name="ViT-B/32", n_classes=10, device=None):
         super().__init__()
-        
-        # Load pre-trained CLIP
-        self.clip_model, self.clip_preprocess = clip.load(clip_model_name, device="cuda")
+
+        # Use global device if not specified
+        if device is None:
+            device = DEVICE
+        self.device = device
+
+        # Load pre-trained CLIP with proper device handling
+        print(f"Loading CLIP model {clip_model_name} on {device}...")
+        self.clip_model, self.clip_preprocess = clip.load(clip_model_name, device=device)
         self.clip_dim = self.clip_model.visual.output_dim
+        print(f"✅ CLIP loaded successfully, embedding dim: {self.clip_dim}")
         
         # Freeze CLIP parameters
         for param in self.clip_model.parameters():
@@ -146,40 +180,56 @@ class ImageRetrieval:
         # Pre-compute MNIST embeddings
         self.mnist_embeddings, self.mnist_labels, self.mnist_images = self._precompute_mnist_embeddings()
         
-    def _precompute_mnist_embeddings(self):
-        """Pre-compute CLIP embeddings untuk semua MNIST images"""
+    def _precompute_mnist_embeddings(self, batch_size=256):
+        """Pre-compute CLIP embeddings untuk semua MNIST images dengan batch processing"""
         print("Pre-computing MNIST CLIP embeddings...")
-        
+
         embeddings = []
         labels = []
         images = []
-        
+
+        # Create dataloader for batch processing
+        mnist_loader = DataLoader(self.mnist_dataset, batch_size=batch_size,
+                                 shuffle=False, num_workers=4, pin_memory=True)
+
         self.model.eval()
         with torch.no_grad():
-            for i, (img, label) in enumerate(self.mnist_dataset):
-                if i % 1000 == 0:
-                    print(f"Processed {i}/{len(self.mnist_dataset)} images")
-                
-                # Convert to PIL and preprocess
-                if isinstance(img, torch.Tensor):
-                    pil_img = Image.fromarray((img.squeeze().numpy() * 255).astype('uint8'))
-                else:
-                    pil_img = img
-                
-                pil_img = pil_img.convert('RGB')
-                clip_input = self.clip_preprocess(pil_img).unsqueeze(0).to(self.device)
-                
-                # Get CLIP embedding
-                img_emb = self.model.encode_images(clip_input)
-                
-                embeddings.append(img_emb.cpu())
-                labels.append(label)
-                images.append(img)
-        
+            for batch_idx, (batch_imgs, batch_labels) in enumerate(mnist_loader):
+                if batch_idx % 50 == 0:
+                    print(f"Processed {batch_idx * batch_size}/{len(self.mnist_dataset)} images")
+
+                # Process batch
+                batch_clip_inputs = []
+                for img in batch_imgs:
+                    # Convert to PIL and preprocess
+                    if isinstance(img, torch.Tensor):
+                        pil_img = Image.fromarray((img.squeeze().numpy() * 255).astype('uint8'))
+                    else:
+                        pil_img = img
+
+                    pil_img = pil_img.convert('RGB')
+                    clip_input = self.clip_preprocess(pil_img)
+                    batch_clip_inputs.append(clip_input)
+
+                # Stack and move to device
+                batch_clip_inputs = torch.stack(batch_clip_inputs).to(self.device)
+
+                # Get CLIP embeddings for batch
+                batch_emb = self.model.encode_images(batch_clip_inputs)
+
+                # Store results (move to CPU to save GPU memory)
+                embeddings.append(batch_emb.cpu())
+                labels.extend(batch_labels.tolist())
+                images.extend(batch_imgs)
+
+                # Clear GPU cache periodically
+                if batch_idx % 100 == 0:
+                    torch.cuda.empty_cache()
+
         embeddings = torch.cat(embeddings, dim=0)
         labels = torch.tensor(labels)
-        
-        print(f"Pre-computed {len(embeddings)} MNIST embeddings")
+
+        print(f"✅ Pre-computed {len(embeddings)} MNIST embeddings")
         return embeddings, labels, images
     
     def retrieve_images(self, eeg_features, class_labels, top_k=5):
@@ -219,15 +269,102 @@ class ImageRetrieval:
             return retrieved_images, retrieved_labels, retrieved_similarities
 
 
-def train_eeg_clip_model(model, train_loader, val_loader, epochs=100, device='cuda'):
-    """Training loop untuk EEG-CLIP model"""
-    
+class CheckpointManager:
+    """Manage checkpoints for EEG-CLIP model"""
+
+    def __init__(self, checkpoint_dir='./clip_checkpoints'):
+        self.checkpoint_dir = checkpoint_dir
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+    def save_checkpoint(self, model, optimizer, scheduler, epoch, val_loss, val_acc, is_best=False):
+        """Save checkpoint with complete state"""
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'val_loss': val_loss,
+            'val_acc': val_acc,
+            'clip_model_name': getattr(model, 'clip_model_name', 'ViT-B/32'),
+            'eeg_dim': getattr(model, 'eeg_dim', 128),
+            'n_classes': getattr(model, 'n_classes', 10)
+        }
+
+        # Save last checkpoint
+        last_path = os.path.join(self.checkpoint_dir, 'eeg_clip_last.pth')
+        torch.save(checkpoint, last_path)
+
+        # Save best checkpoint
+        if is_best:
+            best_path = os.path.join(self.checkpoint_dir, 'eeg_clip_best.pth')
+            torch.save(checkpoint, best_path)
+            print(f"✅ New best model saved: val_loss={val_loss:.4f}, val_acc={val_acc:.4f}")
+
+        # Save epoch checkpoint
+        epoch_path = os.path.join(self.checkpoint_dir, f'eeg_clip_epoch_{epoch:03d}.pth')
+        torch.save(checkpoint, epoch_path)
+
+        return last_path
+
+    def load_checkpoint(self, model, optimizer=None, scheduler=None, checkpoint_path=None):
+        """Load checkpoint and restore state"""
+        if checkpoint_path is None:
+            # Try to load best, then last
+            best_path = os.path.join(self.checkpoint_dir, 'eeg_clip_best.pth')
+            last_path = os.path.join(self.checkpoint_dir, 'eeg_clip_last.pth')
+
+            if os.path.exists(best_path):
+                checkpoint_path = best_path
+            elif os.path.exists(last_path):
+                checkpoint_path = last_path
+            else:
+                print("❌ No checkpoint found")
+                return None
+
+        if not os.path.exists(checkpoint_path):
+            print(f"❌ Checkpoint not found: {checkpoint_path}")
+            return None
+
+        print(f"📂 Loading checkpoint: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=model.device)
+
+        # Load model state
+        model.load_state_dict(checkpoint['model_state_dict'])
+
+        # Load optimizer state
+        if optimizer is not None and 'optimizer_state_dict' in checkpoint:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+        # Load scheduler state
+        if scheduler is not None and 'scheduler_state_dict' in checkpoint:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+        print(f"✅ Checkpoint loaded: epoch {checkpoint['epoch']}, val_loss={checkpoint['val_loss']:.4f}")
+        return checkpoint
+
+
+def train_eeg_clip_model(model, train_loader, val_loader, epochs=100, device='cuda',
+                        resume_from=None, checkpoint_dir='./clip_checkpoints'):
+    """Training loop untuk EEG-CLIP model dengan checkpoint support"""
+
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-    
+
+    # Initialize checkpoint manager
+    checkpoint_manager = CheckpointManager(checkpoint_dir)
+
     best_val_loss = float('inf')
-    
-    for epoch in range(epochs):
+    start_epoch = 0
+
+    # Resume from checkpoint if specified
+    if resume_from:
+        checkpoint = checkpoint_manager.load_checkpoint(model, optimizer, scheduler, resume_from)
+        if checkpoint:
+            start_epoch = checkpoint['epoch'] + 1
+            best_val_loss = checkpoint['val_loss']
+            print(f"🔄 Resuming training from epoch {start_epoch}")
+
+    for epoch in range(start_epoch, epochs):
         # Training phase
         model.train()
         train_loss = 0
@@ -290,17 +427,26 @@ def train_eeg_clip_model(model, train_loader, val_loader, epochs=100, device='cu
         train_acc /= len(train_loader)
         val_loss /= len(val_loader)
         val_acc /= len(val_loader)
-        
+
         print(f"Epoch [{epoch+1}/{epochs}]")
         print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
         print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
         print(f"Temperature: {model.temperature.item():.4f}")
         print("-" * 50)
-        
-        # Save best model
-        if val_loss < best_val_loss:
+
+        # Save checkpoint
+        is_best = val_loss < best_val_loss
+        if is_best:
             best_val_loss = val_loss
-            torch.save(model.state_dict(), 'best_eeg_clip_model.pth')
+
+        checkpoint_manager.save_checkpoint(
+            model, optimizer, scheduler, epoch, val_loss, val_acc, is_best
+        )
+
+        # Early stopping
+        if epoch > 20 and val_loss > best_val_loss * 1.1:
+            print("🛑 Early stopping triggered")
+            break
 
 
 def evaluate_reconstruction_quality(retrieval_system, test_eeg_features, test_labels, save_path='clip_results.png'):
@@ -364,44 +510,75 @@ def evaluate_reconstruction_quality(retrieval_system, test_eeg_features, test_la
     return accuracy, similarities
 
 
-def main_clip_pipeline(eeg_features_train, eeg_labels_train, 
-                      eeg_features_test, eeg_labels_test):
-    """Main pipeline untuk EEG-CLIP reconstruction"""
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-    
+def main_clip_pipeline(eeg_features_train, eeg_labels_train,
+                      eeg_features_test, eeg_labels_test,
+                      epochs=50, batch_size=64, resume_from=None):
+    """Main pipeline untuk EEG-CLIP reconstruction dengan GPU dan checkpoint support"""
+
+    # Use global device
+    device = DEVICE
+    print(f"🚀 Starting EEG-CLIP pipeline on {device}")
+
     # Load MNIST dataset
     transform = transforms.Compose([
         transforms.ToTensor(),
     ])
-    
+
     mnist_dataset = datasets.MNIST('./data', train=True, download=True, transform=transform)
-    
-    # Initialize model
-    model = EEGCLIPModel(eeg_dim=128).to(device)
-    
+    print(f"📊 MNIST dataset loaded: {len(mnist_dataset)} images")
+
+    # Initialize model with proper device
+    print("🧠 Initializing EEG-CLIP model...")
+    model = EEGCLIPModel(eeg_dim=128, device=device).to(device)
+
+    # Enable mixed precision if on GPU
+    if device.type == 'cuda':
+        print("⚡ Mixed precision training enabled")
+
     # Create datasets
-    train_dataset = EEGCLIPDataset(eeg_features_train, eeg_labels_train, 
+    train_dataset = EEGCLIPDataset(eeg_features_train, eeg_labels_train,
                                   mnist_dataset, model.clip_preprocess)
-    
-    # Create data loaders
-    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=4)
-    val_loader = DataLoader(train_dataset, batch_size=64, shuffle=False, num_workers=4)  # For simplicity
-    
-    # Train model
-    print("Training EEG-CLIP model...")
-    train_eeg_clip_model(model, train_loader, val_loader, epochs=50, device=device)
-    
+
+    # Optimize batch size for GPU
+    if device.type == 'cuda':
+        batch_size = min(batch_size * 2, 128)
+        print(f"🎯 GPU detected: Using batch size {batch_size}")
+
+    # Create data loaders with optimized settings
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True if device.type == 'cuda' else False,
+        persistent_workers=True
+    )
+    val_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True if device.type == 'cuda' else False,
+        persistent_workers=True
+    )
+
+    # Train model with checkpoint support
+    print("🏋️ Training EEG-CLIP model...")
+    train_eeg_clip_model(
+        model, train_loader, val_loader,
+        epochs=epochs, device=device, resume_from=resume_from
+    )
+
     # Initialize retrieval system
+    print("🔍 Initializing image retrieval system...")
     retrieval_system = ImageRetrieval(model, mnist_dataset, model.clip_preprocess, device)
-    
+
     # Evaluate
-    print("Evaluating reconstruction quality...")
+    print("📊 Evaluating reconstruction quality...")
     accuracy, similarities = evaluate_reconstruction_quality(
         retrieval_system, eeg_features_test, eeg_labels_test
     )
-    
+
     return model, retrieval_system, accuracy
 
 
