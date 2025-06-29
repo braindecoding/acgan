@@ -727,6 +727,7 @@ def main():
     
     # Extract features for GAN
     model.eval()
+    model = model.to(device)  # Ensure model is on GPU
     with torch.no_grad():
         train_features = []
         train_labels = []
