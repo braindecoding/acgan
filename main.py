@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
+from pytorch_lightning.callbacks import EarlyStopping as PLEarlyStopping, ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 
 import numpy as np
@@ -704,7 +704,7 @@ def main():
     
     # Setup trainer
     callbacks = [
-        EarlyStopping(monitor='val_loss', patience=15),
+        PLEarlyStopping(monitor='val_loss', patience=15),
         ModelCheckpoint(monitor='val_acc', mode='max', save_top_k=1)
     ]
     

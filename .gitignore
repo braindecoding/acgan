@@ -6,11 +6,12 @@ __pycache__/
 *.jpg
 # C extensions
 *.so
-
+lightning_logs/
 # Distribution / packaging
 .Python
 build/
 develop-eggs/
+light
 dist/
 downloads/
 eggs/
