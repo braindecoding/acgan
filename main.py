@@ -653,6 +653,8 @@ def main():
     parser.add_argument('--epochs', type=int, default=150, help='Number of epochs for classifier')
     parser.add_argument('--gan_epochs', type=int, default=2000, help='Number of epochs for GAN')
     parser.add_argument('--device', type=str, default='cuda', help='Device to use')
+    parser.add_argument('--resume_from_checkpoint', type=str, default=None, help='Path to checkpoint to resume from')
+    parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints', help='Directory to save checkpoints')
     args = parser.parse_args()
     
     # Configuration
@@ -702,10 +704,21 @@ def main():
     # Initialize model
     model = EEGClassifierPL(config)
     
+    # Create checkpoint directory
+    import os
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+
     # Setup trainer
     callbacks = [
         PLEarlyStopping(monitor='val_loss', patience=15),
-        ModelCheckpoint(monitor='val_acc', mode='max', save_top_k=1)
+        ModelCheckpoint(
+            monitor='val_acc',
+            mode='max',
+            save_top_k=1,
+            dirpath=args.checkpoint_dir,
+            filename='eeg-classifier-{epoch:02d}-{val_acc:.2f}',
+            save_last=True
+        )
     ]
     
     trainer = pl.Trainer(
@@ -716,10 +729,17 @@ def main():
         precision=16,
         log_every_n_steps=10
     )
-    
+
     # Train classifier
     print("Training EEG classifier...")
-    trainer.fit(model, train_loader, val_loader)
+    if args.resume_from_checkpoint and os.path.exists(args.resume_from_checkpoint):
+        print(f"Resuming from checkpoint: {args.resume_from_checkpoint}")
+        trainer.fit(model, train_loader, val_loader, ckpt_path=args.resume_from_checkpoint)
+    else:
+        if args.resume_from_checkpoint:
+            print(f"Checkpoint not found: {args.resume_from_checkpoint}")
+            print("Starting training from scratch...")
+        trainer.fit(model, train_loader, val_loader)
     
     # Test classifier
     test_results = trainer.test(model, test_loader)
